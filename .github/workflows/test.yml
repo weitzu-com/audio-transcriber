@@ -1,0 +1,70 @@
+name: CI — Import Check & Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python deps
+        run: |
+          pip install faster-whisper
+
+      - name: Import check — all scripts
+        run: |
+          # 验证所有脚本文件语法正确，可 import（不实际运行转写）
+          python3 -c "
+          import py_compile, os, sys
+          scripts_dir = 'scripts'
+          errors = []
+          for f in sorted(os.listdir(scripts_dir)):
+              if f.endswith('.py'):
+                  path = os.path.join(scripts_dir, f)
+                  try:
+                      py_compile.compile(path, doraise=True)
+                      print(f'  ✓ {f}')
+                  except py_compile.PyCompileError as e:
+                      errors.append(f)
+                      print(f'  ✗ {f}: {e}')
+          if errors:
+              print(f'\n{len(errors)} file(s) failed syntax check')
+              sys.exit(1)
+          print(f'\nAll scripts pass syntax check.')
+          "
+
+      - name: JSON validity check
+        run: |
+          python3 -c "
+          import json, os, sys
+          assets_dir = 'assets'
+          errors = []
+          for f in os.listdir(assets_dir):
+              if f.endswith('.json'):
+                  path = os.path.join(assets_dir, f)
+                  try:
+                      with open(path) as fh:
+                          json.load(fh)
+                      print(f'  ✓ assets/{f}')
+                  except json.JSONDecodeError as e:
+                      errors.append(f)
+                      print(f'  ✗ assets/{f}: {e}')
+          if errors:
+              sys.exit(1)
+          print('All JSON files valid.')
+          "

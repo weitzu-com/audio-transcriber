@@ -1,0 +1,18 @@
+{
+  "version": "0.1.0",
+  "skill_name": "audio-transcriber",
+  "created": "2026-06-08",
+  "iteration_count": 0,
+  "defaults": {
+    "model": "medium",
+    "beam_size": 3,
+    "vad_parameters": {
+      "min_silence_duration_ms": 500,
+      "speech_pad_ms": 400
+    },
+    "segment_window_sec": 30,
+    "lang_confidence_threshold": 0.8,
+    "auto_improve_interval": 10
+  },
+  "history": []
+}
