@@ -3,23 +3,21 @@
 pdca_improve.py — PDCA 进化引擎
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Plan → Do → Check → Act → Verify 自动闭环
-输入 (stdin JSON):  {"perf_stats": {...}, "mode": "single|batch", "iteration_count": N,
-                     "quality_score": float}
+输入 (stdin JSON):  {"perf_stats": {...}, "mode": "single|batch"}
 输出 (stdout JSON): {"iteration": N, "auto_applied": [...], "suggestions": [...],
                      "version_bump": "patch|minor|major", "score_delta": float}
-契约版本: 0.1.0
+契约版本: 0.1.1
 """
 
-import json, sys, os, datetime
+import json, sys, os, datetime, statistics
 
 SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VERSION_PATH = os.path.join(SKILL_ROOT, "assets", "version.json")
 LOG_PATH = os.path.join(SKILL_ROOT, "assets", "pdca.log")
 QUEUE_PATH = os.path.join(SKILL_ROOT, "assets", "improve_queue.json")
+BASELINE_PATH = os.path.join(SKILL_ROOT, "assets", "baseline.json")
 
 # 低风险参数（可自动调整）
-LOW_RISK_PARAMS = ["vad_parameters.min_silence_duration_ms",
-                   "vad_parameters.speech_pad_ms", "beam_size"]
 LOW_RISK_RANGES = {
     "vad_parameters.min_silence_duration_ms": [300, 400, 500, 600, 700],
     "vad_parameters.speech_pad_ms": [200, 300, 400, 500],
@@ -28,8 +26,9 @@ LOW_RISK_RANGES = {
 
 # 自动改进阈值
 AUTO_IMPROVE_INTERVAL = 10  # 每 10 次迭代尝试自动改进
-QUALITY_DROP_THRESHOLD = 0.1  # 质量下降超过此值回滚
 NO_SPEECH_HIGH_THRESHOLD = 0.15  # no_speech_ratio 超此值触发告警
+REGRESSION_QUALITY_DROP = 0.15   # 相对 baseline 下降 >15% 触发回归告警
+HISTORY_MAX = 100                # history 截断前保留条数
 
 
 def load_version():
@@ -41,6 +40,7 @@ def load_version():
         "iteration_count": 0,
         "defaults": {},
         "history": [],
+        "aggregates": None,
     }
 
 
@@ -50,7 +50,77 @@ def save_version(v):
         json.dump(v, f, ensure_ascii=False, indent=2)
 
 
-def load_recent_logs(n=20):
+def load_baseline():
+    """加载回归基线"""
+    if os.path.exists(BASELINE_PATH):
+        with open(BASELINE_PATH, "r") as f:
+            return json.load(f)
+    return None
+
+
+def save_baseline(b):
+    os.makedirs(os.path.dirname(BASELINE_PATH), exist_ok=True)
+    with open(BASELINE_PATH, "w") as f:
+        json.dump(b, f, ensure_ascii=False, indent=2)
+
+
+def update_baseline(perf_stats: dict, iteration: int):
+    """首次非 trivial 迭代时建立 baseline，或每 50 次迭代更新一次"""
+    baseline = load_baseline()
+
+    if baseline is None:
+        baseline = {
+            "established_at_iteration": iteration,
+            "quality_score": perf_stats.get("quality_score"),
+            "avg_logprob": perf_stats.get("avg_logprob"),
+            "no_speech_ratio": perf_stats.get("no_speech_ratio"),
+            "realtime_factor": perf_stats.get("realtime_factor"),
+            "model": perf_stats.get("model"),
+        }
+        save_baseline(baseline)
+        return {"action": "baseline_established", "baseline": baseline}
+
+    # 每 50 次迭代更新 baseline
+    if iteration % 50 == 0:
+        baseline["quality_score"] = perf_stats.get("quality_score")
+        baseline["avg_logprob"] = perf_stats.get("avg_logprob")
+        baseline["no_speech_ratio"] = perf_stats.get("no_speech_ratio")
+        baseline["updated_at_iteration"] = iteration
+        save_baseline(baseline)
+        return {"action": "baseline_updated", "baseline": baseline}
+
+    return {"action": "baseline_unchanged", "baseline": baseline}
+
+
+def regression_check(perf_stats: dict) -> dict:
+    """检测质量是否相对 baseline 显著下降"""
+    baseline = load_baseline()
+    if baseline is None:
+        return {"regression": False, "reason": "no_baseline"}
+
+    current_q = perf_stats.get("quality_score", 0)
+    baseline_q = baseline.get("quality_score", 0)
+
+    if baseline_q == 0:
+        return {"regression": False, "reason": "zero_baseline"}
+
+    relative_drop = (baseline_q - current_q) / abs(baseline_q)
+
+    if relative_drop > REGRESSION_QUALITY_DROP:
+        return {
+            "regression": True,
+            "severity": "high" if relative_drop > 0.3 else "medium",
+            "baseline_quality": baseline_q,
+            "current_quality": current_q,
+            "relative_drop_pct": round(relative_drop * 100, 1),
+            "baseline_iteration": baseline.get("established_at_iteration"),
+            "recommendation": "建议回滚到 baseline 参数或人工审查转写结果",
+        }
+
+    return {"regression": False, "relative_drop_pct": round(max(0, relative_drop) * 100, 1)}
+
+
+def load_recent_logs(n=50):
     """加载最近的性能日志"""
     if not os.path.exists(LOG_PATH):
         return []
@@ -88,17 +158,54 @@ def analyze_trend(logs: list) -> dict:
     }
 
 
-def generate_auto_improvements(version: dict, perf_stats: dict, logs: list) -> list:
+def compact_history(version: dict):
+    """在截断 history 前，将旧数据聚合为统计摘要"""
+    history = version.get("history", [])
+    if len(history) <= HISTORY_MAX:
+        return  # 不需要截断
+
+    # 被截断的部分
+    to_compact = history[:-HISTORY_MAX]
+    scores = [h.get("quality_score", 0) for h in to_compact if h.get("quality_score") is not None]
+
+    aggregate = {
+        "compacted_count": len(to_compact),
+        "compacted_range": f"iteration {to_compact[0].get('iteration', '?')}–{to_compact[-1].get('iteration', '?')}",
+        "quality_mean": round(statistics.mean(scores), 4) if scores else None,
+        "quality_stdev": round(statistics.stdev(scores), 4) if len(scores) >= 2 else None,
+        "quality_min": round(min(scores), 4) if scores else None,
+        "quality_max": round(max(scores), 4) if scores else None,
+        "trends": {
+            "improving": sum(1 for h in to_compact if h.get("trend") == "improving"),
+            "stable": sum(1 for h in to_compact if h.get("trend") == "stable"),
+            "declining": sum(1 for h in to_compact if h.get("trend") == "declining"),
+        },
+        "auto_improvements_total": sum(h.get("auto_applied_count", 0) for h in to_compact),
+        "compacted_at": datetime.datetime.now().isoformat(),
+    }
+
+    # 合并已有聚合数据
+    existing = version.get("aggregates", [])
+    if not isinstance(existing, list):
+        existing = []
+    existing.append(aggregate)
+    version["aggregates"] = existing
+
+    # 截断
+    version["history"] = history[-HISTORY_MAX:]
+
+
+def generate_auto_improvements(version: dict, perf_stats: dict) -> list:
     """生成自动改进建议（仅低风险参数）"""
     auto = []
 
     no_speech = perf_stats.get("no_speech_ratio", 0)
 
-    # 如果 no_speech 过高，调低 VAD 静音阈值
     if no_speech > NO_SPEECH_HIGH_THRESHOLD:
         current = version.get("defaults", {}).get("vad_parameters", {}).get(
             "min_silence_duration_ms", 500)
-        idx = LOW_RISK_RANGES["vad_parameters.min_silence_duration_ms"].index(current) if current in LOW_RISK_RANGES["vad_parameters.min_silence_duration_ms"] else 2
+        idx = LOW_RISK_RANGES["vad_parameters.min_silence_duration_ms"].index(current) \
+            if current in LOW_RISK_RANGES["vad_parameters.min_silence_duration_ms"] else 2
         new_val = LOW_RISK_RANGES["vad_parameters.min_silence_duration_ms"][min(idx + 1, 4)]
         auto.append({
             "param": "vad_parameters.min_silence_duration_ms",
@@ -107,7 +214,6 @@ def generate_auto_improvements(version: dict, perf_stats: dict, logs: list) -> l
             "reason": f"no_speech_ratio ({no_speech:.2%}) 过高，放宽 VAD 静音检测",
         })
 
-    # 如果 avg_logprob 低（质量差），尝试提高 beam_size
     avg_logprob = perf_stats.get("avg_logprob", -1)
     if avg_logprob < -0.8:
         current = version.get("defaults", {}).get("beam_size", 3)
@@ -122,15 +228,24 @@ def generate_auto_improvements(version: dict, perf_stats: dict, logs: list) -> l
     return auto
 
 
-def generate_suggestions(perf_stats: dict, trend: dict, version: dict) -> list:
+def generate_suggestions(perf_stats: dict, trend: dict, regression: dict, version: dict) -> list:
     """生成改进建议（含中高风险，需人工确认）"""
     suggestions = []
 
-    # 中风险：模型切换建议
     model = perf_stats.get("model", "medium")
-    rt_factor = perf_stats.get("realtime_factor", 0)
     quality = perf_stats.get("quality_score", 0)
 
+    # 回归告警（最高优先级）
+    if regression.get("regression"):
+        suggestions.append({
+            "risk": "high",
+            "action": f"质量回归检测触发! 相对 baseline 下降 {regression['relative_drop_pct']}%",
+            "reason": f"当前质量分 {regression['current_quality']} vs baseline {regression['baseline_quality']} (iter {regression['baseline_iteration']})",
+            "recommendation": regression.get("recommendation", ""),
+            "files": [BASELINE_PATH, VERSION_PATH],
+        })
+
+    # 中风险：模型切换建议
     if model == "medium" and quality < -0.5:
         suggestions.append({
             "risk": "medium",
@@ -140,11 +255,11 @@ def generate_suggestions(perf_stats: dict, trend: dict, version: dict) -> list:
             "next_iteration_test": "A/B 对比: medium vs large-v3",
         })
 
-    if model == "tiny" and rt_factor > 50:
+    if model == "tiny" and perf_stats.get("realtime_factor", 0) > 50:
         suggestions.append({
             "risk": "medium",
             "action": "从 tiny 升级到 medium 模型",
-            "reason": f"tiny 模型速度快 ({rt_factor}x) 但质量可能不足",
+            "reason": "tiny 模型速度极快但质量可能不足",
             "next_iteration_test": "对比转写结果的前 100 段准确率",
         })
 
@@ -160,7 +275,7 @@ def generate_suggestions(perf_stats: dict, trend: dict, version: dict) -> list:
     return suggestions
 
 
-def bump_version(version: dict, auto_applied: list, suggestions: list) -> str:
+def bump_version(auto_applied: list, suggestions: list) -> str:
     """根据改进类型确定版本号升级"""
     has_high = any(s.get("risk") == "high" for s in suggestions)
     has_medium = any(s.get("risk") == "medium" for s in suggestions)
@@ -182,12 +297,17 @@ def main():
 
     version = load_version()
     iteration = version.get("iteration_count", 0) + 1
-    prev_score = version.get("history", [{}])[-1].get("quality_score", 0) if version.get("history") else 0
+    prev_score = version.get("history", [{}])[-1].get("quality_score", 0) \
+        if version.get("history") else 0
     score_delta = round(perf_stats.get("quality_score", 0) - prev_score, 4)
 
-    # Check: 分析趋势
+    # Check: 分析趋势 + 回归检查
     logs = load_recent_logs()
     trend = analyze_trend(logs)
+
+    # 建立/更新 baseline，检测回归
+    baseline_result = update_baseline(perf_stats, iteration)
+    regression = regression_check(perf_stats) if iteration > 1 else {"regression": False}
 
     # Act: 生成改进
     auto_applied = []
@@ -195,9 +315,9 @@ def main():
 
     # 仅每 AUTO_IMPROVE_INTERVAL 次迭代尝试自动改进（避免频繁抖动）
     if iteration % AUTO_IMPROVE_INTERVAL == 0:
-        auto_applied = generate_auto_improvements(version, perf_stats, logs)
+        auto_applied = generate_auto_improvements(version, perf_stats)
 
-    suggestions = generate_suggestions(perf_stats, trend, version)
+    suggestions = generate_suggestions(perf_stats, trend, regression, version)
 
     # 应用自动改进（低风险）
     for improvement in auto_applied:
@@ -207,7 +327,7 @@ def main():
         elif improvement.get("param") == "beam_size":
             version["defaults"]["beam_size"] = improvement.get("to")
 
-    # 中等风险建议：写入 improve_queue 等待 A/B 测试
+    # 中高风险建议：写入 improve_queue
     queue = {"pending": [], "applied": [], "rejected": []}
     if os.path.exists(QUEUE_PATH):
         try:
@@ -217,15 +337,19 @@ def main():
             pass
 
     for s in suggestions:
-        if s["risk"] == "medium" and s not in queue["pending"]:
-            queue["pending"].append({**s, "iteration": iteration, "timestamp": datetime.datetime.now().isoformat()})
+        if s not in queue["pending"]:
+            queue["pending"].append({
+                **s,
+                "iteration": iteration,
+                "timestamp": datetime.datetime.now().isoformat(),
+            })
 
     os.makedirs(os.path.dirname(QUEUE_PATH), exist_ok=True)
     with open(QUEUE_PATH, "w") as f:
         json.dump(queue, f, ensure_ascii=False, indent=2)
 
     # 版本号升级
-    version_bump = bump_version(version, auto_applied, suggestions)
+    version_bump = bump_version(auto_applied, suggestions)
     parts = version["version"].split(".")
     if version_bump == "major":
         parts[0] = str(int(parts[0]) + 1)
@@ -249,9 +373,8 @@ def main():
         "timestamp": datetime.datetime.now().isoformat(),
     })
 
-    # 保留最近 100 条历史（防膨胀）
-    if len(version["history"]) > 100:
-        version["history"] = version["history"][-100:]
+    # 截断前聚合统计
+    compact_history(version)
 
     save_version(version)
 
@@ -261,6 +384,8 @@ def main():
         "version_bump": version_bump,
         "score_delta": score_delta,
         "trend": trend,
+        "baseline": baseline_result,
+        "regression": regression,
         "auto_applied": auto_applied,
         "suggestions": suggestions,
     }

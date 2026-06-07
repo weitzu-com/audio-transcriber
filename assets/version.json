@@ -1,5 +1,5 @@
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "skill_name": "audio-transcriber",
   "created": "2026-06-08",
   "iteration_count": 0,
@@ -14,5 +14,6 @@
     "lang_confidence_threshold": 0.8,
     "auto_improve_interval": 10
   },
+  "aggregates": [],
   "history": []
 }

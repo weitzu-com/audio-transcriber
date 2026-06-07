@@ -7,11 +7,12 @@ channel_detect.py — 声道发现 + 分段语言识别
 契约版本: 0.1.0
 """
 
-import json, sys, subprocess, tempfile, os
+import json, sys, subprocess, tempfile, os, math
 from faster_whisper import WhisperModel
 
 SEGMENT_WINDOW = 30      # 语言检测段长度（秒）
 LANG_CONFIDENCE = 0.80   # 低于此置信度时切更细粒度
+MIN_DURATION = 0.5       # 最短有效音频（秒）
 
 
 def ffprobe(path: str) -> dict:
@@ -21,6 +22,9 @@ def ffprobe(path: str) -> dict:
         "-show_format", "-show_streams", path,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not result.stdout.strip():
+        raise ValueError(f"ffprobe 失败: {result.stderr.strip()}")
+
     data = json.loads(result.stdout)
 
     streams = [s for s in data.get("streams", []) if s["codec_type"] == "audio"]
@@ -28,10 +32,12 @@ def ffprobe(path: str) -> dict:
         raise ValueError("未找到音频流")
 
     s = streams[0]
+    duration = float(s.get("duration", 0) or 0)
+
     return {
         "channels": s.get("channels", 1),
         "channel_layout": s.get("channel_layout", "unknown"),
-        "duration_sec": float(s.get("duration", 0)),
+        "duration_sec": duration,
         "sample_rate": int(s.get("sample_rate", 0)),
         "codec": s.get("codec_name", "unknown"),
     }
@@ -39,24 +45,32 @@ def ffprobe(path: str) -> dict:
 
 def extract_channel_sample(audio_path: str, channel_idx: int, total_channels: int,
                            start: float, duration: float, output: str) -> bool:
-    """提取指定声道的某个时间段样本"""
+    """提取指定声道的某个时间段样本。
+    单声道：直接裁剪。2-8声道：channelsplit。>8声道：pan 滤镜回退。"""
+    if duration <= 0:
+        return False
+
     if total_channels == 1:
-        # 单声道直接裁剪
         cmd = [
             "ffmpeg", "-y", "-ss", str(start), "-t", str(duration),
             "-i", audio_path, "-ac", "1", "-ar", "16000", output,
         ]
-    else:
-        # 多声道用 channelsplit 提取
-        ch_label = f"CH{channel_idx}"
-        filter_str = f"[0:a]channelsplit=channel_layout={total_channels}c[ch{channel_idx}]" if total_channels <= 8 else f"[0:a]pan=mono|c0=c{channel_idx}[out]"
+    elif total_channels <= 8:
+        # channelsplit: 可靠且高效
         cmd = [
             "ffmpeg", "-y", "-ss", str(start), "-t", str(duration),
             "-i", audio_path, "-filter_complex",
-            f"[0:a]channelsplit=channel_layout={total_channels}c[ch{channel_idx}]"
-            if total_channels <= 8
-            else f"[0:a]pan=mono|c0=c{channel_idx}[out]",
-            "-map", f"[ch{channel_idx}]" if total_channels <= 8 else "[out]",
+            f"[0:a]channelsplit=channel_layout={total_channels}c[ch{channel_idx}]",
+            "-map", f"[ch{channel_idx}]",
+            "-ac", "1", "-ar", "16000", output,
+        ]
+    else:
+        # >8声道: pan 滤镜回退
+        cmd = [
+            "ffmpeg", "-y", "-ss", str(start), "-t", str(duration),
+            "-i", audio_path, "-filter_complex",
+            f"[0:a]pan=mono|c0=c{channel_idx}[ch{channel_idx}]",
+            "-map", "[ch{channel_idx}]",
             "-ac", "1", "-ar", "16000", output,
         ]
     result = subprocess.run(cmd, capture_output=True)
@@ -82,6 +96,13 @@ def detect_channel_languages(model: WhisperModel, audio_path: str,
     total_ch = info["channels"]
     duration = info["duration_sec"]
     channels = []
+
+    # 空音频回退: duration <= 0 时返回占位声道
+    if duration <= MIN_DURATION:
+        return [{"index": i, "language": "unknown", "lang_prob": 0.0,
+                 "mixed": False, "segments": [],
+                 "warning": f"音频时长 {duration}s < {MIN_DURATION}s 阈值"}
+                for i in range(total_ch)]
 
     with tempfile.TemporaryDirectory() as tmpdir:
         for ch_idx in range(total_ch):
@@ -148,7 +169,28 @@ def main():
     model = WhisperModel("tiny", device="cpu", compute_type="int8")
 
     # 获取元数据
-    info = ffprobe(audio_path)
+    try:
+        info = ffprobe(audio_path)
+    except ValueError as e:
+        print(json.dumps({"error": str(e), "audio_path": audio_path}, ensure_ascii=False))
+        sys.exit(1)
+
+    # 空音频回退
+    if info["duration_sec"] <= MIN_DURATION:
+        print(json.dumps({
+            "audio_path": audio_path,
+            "total_channels": info["channels"],
+            "channel_layout": info["channel_layout"],
+            "duration_sec": info["duration_sec"],
+            "sample_rate": info["sample_rate"],
+            "codec": info["codec"],
+            "channels": [{"index": i, "language": "unknown", "lang_prob": 0.0,
+                          "mixed": False, "segments": [],
+                          "warning": f"音频过短 ({info['duration_sec']}s)"}
+                         for i in range(info["channels"])],
+            "warning": "AUDIO_TOO_SHORT",
+        }, ensure_ascii=False, indent=2))
+        sys.exit(0)
 
     # 检测每个声道的语言
     channels = detect_channel_languages(model, audio_path, info)

@@ -4,7 +4,7 @@ channel_split.py — 声道分离引擎
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 输入 (stdin JSON):  {"audio_path": "...", "channels": [...], "output_dir": "..."}
 输出 (stdout JSON): {"files": [{"channel": 0, "lang": "ja", "path": "..."}, ...]}
-契约版本: 0.1.0
+契约版本: 0.1.1
 """
 
 import json, sys, os, subprocess
